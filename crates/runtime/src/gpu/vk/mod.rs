@@ -41,6 +41,8 @@ pub struct Ctx {
     pub max_push: u32,
     /// VK_EXT_external_memory_host (zero-copy access to guest memory).
     pub ext_host: Option<ash::ext::external_memory_host::Device>,
+    /// The device accepts dma-buf imports (RADV does, for memfd sections).
+    pub dmabuf: bool,
     /// VK_NV_device_diagnostic_checkpoints (DS_GPU_CHECKPOINTS=1): markers
     /// read back after a device loss.
     pub checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
@@ -564,14 +566,23 @@ fn init_inner() -> Result<(), String> {
             .unwrap_or_default()
             .iter()
             .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::external_memory_host::NAME);
+        let dev_exts = instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
+        let dev_has = |n: &CStr| dev_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
         let mut dexts = vec![ash::khr::swapchain::NAME.as_ptr(), ash::khr::push_descriptor::NAME.as_ptr()];
         if host_import {
             dexts.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
+        // RADV refuses a host pointer over shared memory but accepts a dma-buf
+        // built from the section's memfd. Only Linux, only when both extensions exist.
+        let dma_ok = cfg!(target_os = "linux")
+            && dev_has(ash::khr::external_memory_fd::NAME)
+            && dev_has(ash::ext::external_memory_dma_buf::NAME);
+        if dma_ok {
+            dexts.push(ash::khr::external_memory_fd::NAME.as_ptr());
+            dexts.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+        }
         // Exclusive fullscreen under the application's control, and borderless windows the
         // driver may not turn into exclusive mode (`present`); HDR metadata for HDR10 output.
-        let dev_exts = instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
-        let dev_has = |n: &CStr| dev_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
         let has_fse = cfg!(windows) && surface_caps2 && dev_has(ash::ext::full_screen_exclusive::NAME) && std::env::var("DS_NO_FSE").is_err();
         if has_fse {
             dexts.push(ash::ext::full_screen_exclusive::NAME.as_ptr());
@@ -1164,6 +1175,7 @@ fn init_inner() -> Result<(), String> {
             push_desc: ash::khr::push_descriptor::Device::new(&instance, &device),
             max_push,
             ext_host: host_import.then(|| ash::ext::external_memory_host::Device::new(&instance, &device)),
+            dmabuf: dma_ok && std::path::Path::new("/dev/udmabuf").exists(),
             checkpoints: has_ckpt.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
             exec_props: has_stats.then(|| ash::khr::pipeline_executable_properties::Device::new(&instance, &device)),
             calibrated: calibrated.then(|| ash::ext::calibrated_timestamps::Device::new(&instance, &device)),
@@ -2156,10 +2168,50 @@ impl Ctx {
         }
     }
 
+    /// Imports a dma-buf made from a memfd by udmabuf, when RADV refuses the
+    /// host pointer. The fd is not owned here: the caller closes it.
+    #[cfg(target_os = "linux")]
+    pub fn import_dmabuf(&self, fd: i32, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
+        let usage = self.addressable(usage);
+        let ht = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+        unsafe {
+            let mut ebi = vk::ExternalMemoryBufferCreateInfo::default().handle_types(ht);
+            let bi = self.shared(vk::BufferCreateInfo::default().size(size).usage(usage)).push_next(&mut ebi);
+            let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer(dma-buf): {e}"))?;
+            let req = self.device.get_buffer_memory_requirements(buf);
+            let Some(ty) = self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|| self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+            else {
+                self.device.destroy_buffer(buf, None);
+                return Err("no memory type for a dma-buf import".into());
+            };
+            let mut ifd = vk::ImportMemoryFdInfoKHR::default().handle_type(ht).fd(fd);
+            let mut fl = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut ifd);
+            let ai = if self.device_addresses { ai.push_next(&mut fl) } else { ai };
+            let mem = match self.device.allocate_memory(&ai, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buf, None);
+                    return Err(format!("vkAllocateMemory(dma-buf {size:#x}): {e}"));
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buf, mem, 0) {
+                self.device.destroy_buffer(buf, None);
+                self.device.free_memory(mem, None);
+                return Err(format!("bind dma-buf: {e}"));
+            }
+            let va = if self.device_addresses {
+                self.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf))
+            } else { 0 };
+            Ok((buf, mem, va))
+        }
+    }
+
     /// Imports existing host memory [ptr, ptr+size) (page aligned) as a GPU
     /// buffer (VK_EXT_external_memory_host): the GPU reads and writes it in place.
     /// The third value is the buffer's GPU address (0 without bufferDeviceAddress).
-    pub fn import_host(&self, ptr: u64, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
+    fn import_host_ptr(&self, ptr: u64, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
         let usage = if self.device_addresses { usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS } else { usage };
         let ext = self.ext_host.as_ref().ok_or("VK_EXT_external_memory_host not available")?;
         let ht = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
@@ -2205,6 +2257,42 @@ impl Ctx {
             }
             let va = if self.device_addresses { self.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) } else { 0 };
             Ok((buf, mem, va))
+        }
+    }
+
+    /// Host pointer first; on RADV's refusal, try the dma-buf route before
+    /// giving up. Both paths and every rejection are counted for the status line.
+    pub fn import_host(&self, ptr: u64, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
+        match self.import_host_ptr(ptr, size, usage) {
+            Ok(r) => {
+                #[cfg(target_os = "linux")]
+                crate::platform::os::note_host(true);
+                Ok(r)
+            }
+            Err(e) => {
+                #[cfg(target_os = "linux")]
+                crate::platform::os::note_host(false);
+                #[cfg(target_os = "linux")]
+                if self.dmabuf {
+                    if let Some((fd, n)) = crate::platform::os::host_import_source(ptr, size) {
+                        match self.import_dmabuf(fd, n, usage) {
+                            Ok(r) => {
+                                crate::platform::os::note_dma(true);
+                                unsafe { libc::close(fd) };
+                                return Ok(r);
+                            }
+                            Err(err) => {
+                                crate::platform::os::note_dma(false);
+                                crate::warn!("dma-buf import of {ptr:#x}+{size:#x} failed: {err}");
+                            }
+                        }
+                        unsafe { libc::close(fd) };
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = self.dmabuf;
+                Err(e)
+            }
         }
     }
 
