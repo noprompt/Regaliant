@@ -3819,6 +3819,8 @@ pub fn status_ex(with_stacks: bool) -> String {
     s.push_str(&profile_summary());
     s.push_str(&exec::shader_profile());
     s.push_str(&zk::status_line());
+    #[cfg(target_os = "linux")]
+    s.push_str(&format!("{}\n", crate::platform::os::dma_status()));
     {
         let k = images::Images::keyed_views();
         if k[0] + k[1] > 0 {

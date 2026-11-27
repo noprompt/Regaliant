@@ -52,6 +52,8 @@ struct Region {
     committed: bool,
     mapped: bool,
     watch: bool,
+    /// memfd and view offset, for the dma-buf import of a guest range.
+    section: Option<(i32, u64)>,
 }
 struct Maps {
     regions: BTreeMap<usize, Region>,
@@ -207,6 +209,7 @@ pub unsafe fn VirtualAlloc(
             committed: commit,
             mapped: false,
             watch,
+            section: None,
         },
     );
     p
@@ -279,6 +282,7 @@ pub unsafe fn VirtualFree(address: *mut c_void, size: usize, flags: u32) -> i32 
                 committed: false,
                 mapped: false,
                 watch: false,
+                section: None,
             },
         );
         return 1;
@@ -305,6 +309,7 @@ pub unsafe fn VirtualFree(address: *mut c_void, size: usize, flags: u32) -> i32 
                     committed: false,
                     mapped: false,
                     watch: false,
+                    section: None,
                 },
             );
         } else {
@@ -473,6 +478,82 @@ pub unsafe fn VirtualQuery(
     }
     0
 }
+/// udmabuf_create from linux/udmabuf.h: _IOW('u', 0x42, 24-byte struct).
+fn section_to_dmabuf(fd: i32, offset: u64, size: u64) -> Option<i32> {
+    #[repr(C)]
+    struct UdmabufCreate { memfd: u32, flags: u32, offset: u64, size: u64 }
+    const UDMABUF_CREATE: libc::c_ulong = 0x4018_7542;
+    let dev = unsafe { libc::open(c"/dev/udmabuf".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if dev < 0 {
+        DMA_IOCTL_FAIL.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let c = UdmabufCreate { memfd: fd as u32, flags: 0, offset, size };
+    let r = unsafe { libc::ioctl(dev, UDMABUF_CREATE, &c) };
+    let err = std::io::Error::last_os_error();
+    unsafe { libc::close(dev) };
+    if r < 0 {
+        DMA_IOCTL_FAIL.fetch_add(1, Ordering::Relaxed);
+        crate::warn!("udmabuf ioctl fd={fd} off={offset:#x} size={size:#x}: {err}");
+    }
+    (r >= 0).then_some(r)
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static HOST_OK: AtomicU64 = AtomicU64::new(0);
+static HOST_FAIL: AtomicU64 = AtomicU64::new(0);
+static DMA_OK: AtomicU64 = AtomicU64::new(0);
+static DMA_FAIL: AtomicU64 = AtomicU64::new(0);
+static DMA_NO_SECTION: AtomicU64 = AtomicU64::new(0);
+static DMA_CROSSES_MEMFD: AtomicU64 = AtomicU64::new(0);
+static DMA_UNALIGNED: AtomicU64 = AtomicU64::new(0);
+static DMA_IOCTL_FAIL: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_host(ok: bool) {
+    if ok { HOST_OK.fetch_add(1, Ordering::Relaxed); } else { HOST_FAIL.fetch_add(1, Ordering::Relaxed); }
+}
+pub fn note_dma(ok: bool) {
+    if ok { DMA_OK.fetch_add(1, Ordering::Relaxed); } else { DMA_FAIL.fetch_add(1, Ordering::Relaxed); }
+}
+
+pub fn dma_status() -> String {
+    format!("    dma-buf imports: host ok {}, host failed {}, dma ok {}, dma import failed {}, no section {}, crosses memfd {}, unaligned {}, ioctl failed {}\n",
+        HOST_OK.load(Ordering::Relaxed), HOST_FAIL.load(Ordering::Relaxed),
+        DMA_OK.load(Ordering::Relaxed), DMA_FAIL.load(Ordering::Relaxed),
+        DMA_NO_SECTION.load(Ordering::Relaxed), DMA_CROSSES_MEMFD.load(Ordering::Relaxed),
+        DMA_UNALIGNED.load(Ordering::Relaxed), DMA_IOCTL_FAIL.load(Ordering::Relaxed))
+}
+
+/// The dma-buf and the exact range it covers for a host pointer inside a
+/// section. Views are windows onto one large memfd, so the offset is absolute;
+/// a range past the memfd's end or not page-aligned is refused: the import's
+/// length is what vkCreateBuffer sees, and a shorter dma-buf would let the GPU
+/// write outside the buffer and lose the device.
+pub fn host_import_source(ptr: u64, size: u64) -> Option<(i32, u64)> {
+    let maps = MAPS.lock();
+    let at = ptr as usize;
+    let Some((start, r)) = maps.find(at) else {
+        DMA_NO_SECTION.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let Some((fd, base)) = r.section else {
+        DMA_NO_SECTION.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let off = base + (at - start) as u64;
+    const PAGE: u64 = 4096;
+    if off % PAGE != 0 || size % PAGE != 0 {
+        DMA_UNALIGNED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if size == 0 || off.checked_add(size).is_none() || unsafe { libc::fstat(fd, &mut st) } != 0 || off + size > st.st_size as u64 {
+        DMA_CROSSES_MEMFD.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    section_to_dmabuf(fd, off, size).map(|d| (d, size))
+}
+
 pub unsafe fn CreateFileMappingW(
     _file: HANDLE,
     _attrs: *const c_void,
@@ -481,7 +562,9 @@ pub unsafe fn CreateFileMappingW(
     lo: u32,
     _name: *const u16,
 ) -> HANDLE {
-    let fd = unsafe { libc::memfd_create(c"regaliant-section".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe {
+        libc::memfd_create(c"regaliant-section".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+    };
     if fd < 0 {
         return failure();
     }
@@ -492,6 +575,7 @@ pub unsafe fn CreateFileMappingW(
         }
         return failure();
     }
+    unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK) };
     (fd as usize + 1) as HANDLE
 }
 pub unsafe fn MapViewOfFile3(
@@ -541,6 +625,7 @@ pub unsafe fn MapViewOfFile3(
             committed: true,
             mapped: true,
             watch: false,
+            section: Some((section as i32 - 1, off)),
         },
     );
     MEMORY_MAPPED_VIEW_ADDRESS { Value: p }
